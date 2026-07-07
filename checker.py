@@ -1,18 +1,19 @@
 """
 Ulm Staatsangehörigkeitsbehörde slot checker.
-Phase A: DEBUG mode — navigates to the portal, takes a screenshot
-and saves the HTML so we can identify the right buttons/selectors.
+Phase A2: DEBUG mode — goes straight to the Staatsangehörigkeitsbehörde
+(step 2), snapshots the Anliegen list, then tries to reach the calendar
+(step 3) and snapshots that too.
 """
 import os
 import urllib.request
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-PORTAL_URL = "https://ssc.wilkencloud.de/ulm/"
+STEP2_URL = "https://ssc.wilkencloud.de/ulm/select2?md=4"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
-DEBUG = os.environ.get("DEBUG", "1") == "1"   # Phase A: leave at 1
+DEBUG = os.environ.get("DEBUG", "1") == "1"
+
 
 def notify(message: str):
-    """Send a push notification to your phone via ntfy.sh."""
     if not NTFY_TOPIC:
         print("No NTFY_TOPIC set, skipping notification")
         return
@@ -23,24 +24,73 @@ def notify(message: str):
     )
     urllib.request.urlopen(req)
 
+
+def snapshot(page, name: str):
+    page.screenshot(path=f"{name}.png", full_page=True)
+    with open(f"{name}.html", "w", encoding="utf-8") as f:
+        f.write(page.content())
+    print(f"Snapshot saved: {name}")
+
+
+def accept_cookies(page):
+    try:
+        page.click("#cookie_msg_btn_yes", timeout=3000)
+        print("Cookie banner accepted")
+    except PWTimeout:
+        print("No cookie banner shown")
+
+
 def main():
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
-        page.goto(PORTAL_URL, wait_until="networkidle")
 
-        # ---- PHASE B LOGIC GOES HERE ----
-        # After we see the debug screenshot, this section will contain
-        # the clicks: select Behörde -> select Anliegen -> open calendar,
-        # then check whether any bookable day/time exists.
-        # ----------------------------------
+        # --- Step 2: Anliegen list for Staatsangehoerigkeitsbehoerde ---
+        page.goto(STEP2_URL, wait_until="networkidle")
+        accept_cookies(page)
+        snapshot(page, "step2_anliegen")
 
-        if DEBUG:
-            page.screenshot(path="debug.png", full_page=True)
-            with open("debug.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
-            print("Debug snapshot saved.")
+        # --- Try to reach Step 3 (calendar) generically ---
+        # TEVIS portals usually have a "+" per Anliegen and a Weiter button.
+        try:
+            plus_buttons = page.locator(
+                "input[id^='button-plus'], button[id^='button-plus']"
+            )
+            count = plus_buttons.count()
+            print(f"Found {count} plus-buttons")
+            if count > 0:
+                plus_buttons.first.click()
+                page.wait_for_timeout(1000)
+
+            # Common ids/labels for the continue button on TEVIS:
+            for sel in ["#WeiterButton", "input[value='Weiter']",
+                        "button:has-text('Weiter')"]:
+                try:
+                    page.click(sel, timeout=3000)
+                    print(f"Clicked continue via {sel}")
+                    break
+                except PWTimeout:
+                    continue
+
+            # Some portals show an info modal with an OK/Weiter confirm:
+            for sel in ["#OKNewWindow", "button:has-text('OK')",
+                        "#dialog_weiter", "button:has-text('Weiter')"]:
+                try:
+                    page.click(sel, timeout=2000)
+                    print(f"Clicked modal confirm via {sel}")
+                    break
+                except PWTimeout:
+                    continue
+
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(2000)
+            snapshot(page, "step3_calendar")
+        except Exception as e:
+            print(f"Could not reach step 3 automatically: {e}")
+            snapshot(page, "step3_attempt")
+
         browser.close()
+
 
 if __name__ == "__main__":
     main()
