@@ -33,6 +33,6 @@ jobs:
         with:
           name: debug-snapshot
           path: |
-            debug.png
-            debug.html
+            *.png
+            *.html
           if-no-files-found: ignore
