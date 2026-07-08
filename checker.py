@@ -1,15 +1,15 @@
 """
-Ulm Staatsangehoerigkeitsbehoerde slot checker - FINAL
-Anliegen: "Anliegen rund um die Einbuergerung" (cnc-600)
-Flow: start page (session) -> location page via direct URL -> Weiter
-      -> suggest page -> check for "Kein freier Termin verfuegbar"
+Ulm Staatsangehoerigkeitsbehoerde slot checker - FINAL v2
+Walks the wizard like a human (the portal rejects URL shortcuts):
+start -> select2?md=4 -> check Anliegen cnc-600 -> OK modal
+-> Weiter -> Standort page -> Weiter -> suggest page -> evaluate.
 """
 import os
 import urllib.request
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 BASE = "https://ssc.wilkencloud.de/ulm/"
-STEP3_URL = BASE + "location?mdt=19&select_cnc=1&cnc-600=1"
+STEP2_URL = BASE + "select2?md=4"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
 NO_SLOTS_TEXT = "Kein freier Termin verfügbar"
@@ -35,53 +35,94 @@ def snapshot(page, name: str):
         f.write(page.content())
 
 
+def click_weiter(page) -> bool:
+    """Click the continue button, trying known TEVIS variants."""
+    for sel in ["#WeiterButton", "input[value='Weiter']",
+                "button:has-text('Weiter')"]:
+        try:
+            page.click(sel, timeout=4000)
+            print(f"Clicked Weiter via {sel}")
+            return True
+        except PWTimeout:
+            continue
+    return False
+
+
+def fail(page, browser, name: str, msg: str):
+    snapshot(page, name)
+    notify(f"Checker problem: {msg} Check the debug artifact.", "default")
+    browser.close()
+
+
 def main():
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
 
-        # 1. Start page: establishes the session cookie
+        # 1. Start page: establishes session, accept cookies
         page.goto(BASE, wait_until="networkidle")
         try:
             page.click("#cookie_msg_btn_yes", timeout=3000)
         except PWTimeout:
             pass
 
-        # 2. Jump directly to the Standort page with Anliegen preselected
-        page.goto(STEP3_URL, wait_until="networkidle")
+        # 2. Step 2: Anliegen page of the Staatsangehoerigkeitsbehoerde
+        page.goto(STEP2_URL, wait_until="networkidle")
 
-        # 3. Click Weiter on the Standort page (single location in Ulm).
-        #    Try the known TEVIS selectors in order.
-        clicked = False
-        for sel in ["#WeiterButton", "input[value='Weiter']",
-                    "button:has-text('Weiter')"]:
+        # 3. Tick the checkbox "Anliegen rund um die Einbuergerung".
+        #    It is custom-styled, so click the visible span first.
+        try:
+            page.click("#span-cnc-600", timeout=5000)
+        except PWTimeout:
             try:
-                page.click(sel, timeout=4000)
-                clicked = True
-                print(f"Clicked Weiter via {sel}")
-                break
-            except PWTimeout:
-                continue
-        if not clicked:
-            snapshot(page, "error_no_weiter")
-            notify("Checker problem: Weiter button not found on "
-                   "Standort page. Check the debug artifact.", "default")
-            browser.close()
-            return
+                page.check("#cnc-600", force=True)
+            except Exception:
+                fail(page, browser, "error_checkbox",
+                     "Anliegen checkbox cnc-600 not found.")
+                return
+        page.wait_for_timeout(500)
 
+        # 4. The Hinweis modal ("Bitte buchen Sie einen Termin pro Person")
+        try:
+            page.click("#OKButton", timeout=5000)
+            page.wait_for_selector("#TevisDialog", state="hidden",
+                                   timeout=5000)
+            print("Hinweis modal confirmed")
+        except PWTimeout:
+            print("No modal appeared (ok, continuing)")
+        page.wait_for_timeout(500)
+
+        # 5. Weiter -> Standort page
+        if not click_weiter(page):
+            fail(page, browser, "error_step2_weiter",
+                 "Weiter button not clickable on Anliegen page.")
+            return
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1500)
+
+        # 6. Standort page: single location; some setups need a select
+        #    click first - try it, ignore if absent - then Weiter.
+        try:
+            page.click("button:has-text('Auswählen')", timeout=2000)
+        except PWTimeout:
+            pass
+        if not click_weiter(page):
+            fail(page, browser, "error_step3_weiter",
+                 "Weiter button not found on Standort page.")
+            return
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(2000)
+
+        # 7. Evaluate the Terminvorschlaege page
         content = page.content()
         snapshot(page, "last_check")
 
-        # 4. Decide
         if NO_SLOTS_TEXT in content:
             print("No slots available.")
         elif "Terminvorschläge" in content or "suggest" in page.url:
             notify("TERMIN VERFÜGBAR! Staatsangehörigkeitsbehörde Ulm "
                    "hat freie Termine. Jetzt buchen: " + BASE)
         else:
-            # Page looks different than expected - portal may have changed
             notify("Checker unsure: unexpected page layout. "
                    "Possibly slots available - check manually. " + BASE,
                    "default")
