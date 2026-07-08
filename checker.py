@@ -1,9 +1,7 @@
 """
-Ulm Staatsangehoerigkeitsbehoerde slot checker - FINAL v3
-Correct wizard order:
-  start -> select2?md=4 -> tick cnc-600 -> Weiter (opens Hinweis modal)
-  -> OK in modal (navigates to step 3 Standort) -> Weiter on Standort
-  -> step 4 suggestions -> evaluate.
+Ulm Staatsangehoerigkeitsbehoerde slot checker - FINAL v4
+Weiter is a submit button that opens a modal instead of navigating,
+so we click it fire-and-forget and confirm success via the modal.
 """
 import os
 import urllib.request
@@ -36,11 +34,13 @@ def snapshot(page, name: str):
         f.write(page.content())
 
 
-def click_weiter(page) -> bool:
+def click_weiter(page):
+    """Click Weiter without waiting for navigation (it may open a modal
+    instead). no_wait_after avoids a false timeout on submit buttons."""
     for sel in ["#WeiterButton", "input[value='Weiter']",
                 "button:has-text('Weiter')"]:
         try:
-            page.click(sel, timeout=4000)
+            page.click(sel, timeout=4000, no_wait_after=True)
             print(f"Clicked Weiter via {sel}")
             return True
         except PWTimeout:
@@ -81,33 +81,41 @@ def main():
                 return
         page.wait_for_timeout(500)
 
-        # 4. Weiter -> this OPENS the Hinweis modal (#TevisDialog)
-        if not click_weiter(page):
-            fail(page, browser, "error_step2_weiter",
-                 "Weiter button not clickable on Anliegen page.")
-            return
+        # 4. Weiter -> opens the Hinweis modal (fire-and-forget)
+        click_weiter(page)
 
-        # 5. Wait for the modal, then click its OK -> navigates to step 3
+        # 5. Confirm the modal opened, then click OK -> navigates to step 3
         try:
-            page.wait_for_selector("#TevisDialog", state="visible",
-                                   timeout=5000)
-            page.click("#OKButton", timeout=5000)
+            page.wait_for_selector("#TevisDialog.in", timeout=6000)
+            page.click("#OKButton", timeout=5000, no_wait_after=True)
             print("Hinweis modal OK clicked -> going to Standort")
         except PWTimeout:
             fail(page, browser, "error_modal",
-                 "Hinweis modal / OKButton did not appear after Weiter.")
+                 "Hinweis modal did not open after Weiter.")
             return
 
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(2500)
 
-        # 6. Standort page -> Weiter -> step 4
-        if not click_weiter(page):
+        # 6. Standort page -> Weiter -> step 4.
+        #    This Weiter DOES navigate, so allow the default wait.
+        clicked = False
+        for sel in ["#WeiterButton", "input[value='Weiter']",
+                    "button:has-text('Weiter')"]:
+            try:
+                page.click(sel, timeout=5000)
+                clicked = True
+                print(f"Clicked Standort Weiter via {sel}")
+                break
+            except PWTimeout:
+                continue
+        if not clicked:
             fail(page, browser, "error_step3_weiter",
                  "Weiter button not found on Standort page.")
             return
+
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(2500)
 
         # 7. Evaluate step 4
         content = page.content()
