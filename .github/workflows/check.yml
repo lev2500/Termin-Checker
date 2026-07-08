@@ -24,7 +24,6 @@ jobs:
       - name: Run checker
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          DEBUG: "1"
         run: python checker.py
 
       - name: Upload debug snapshot
