@@ -1,7 +1,9 @@
 """
-Ulm Staatsangehoerigkeitsbehoerde slot checker - FINAL v4
-Weiter is a submit button that opens a modal instead of navigating,
-so we click it fire-and-forget and confirm success via the modal.
+Ulm Staatsangehoerigkeitsbehoerde slot checker - FINAL v6
+Correct two-modal flow (confirmed by user):
+  tick cnc-600 -> OK (modal 1, enables Weiter) -> Weiter
+  -> OK (modal 2) -> step 3 Standort -> Weiter -> step 4 -> evaluate.
+Verifies the Schritt (step) via page title before each transition.
 """
 import os
 import urllib.request
@@ -34,24 +36,28 @@ def snapshot(page, name: str):
         f.write(page.content())
 
 
-def click_weiter(page):
-    """Click Weiter without waiting for navigation (it may open a modal
-    instead). no_wait_after avoids a false timeout on submit buttons."""
-    for sel in ["#WeiterButton", "input[value='Weiter']",
-                "button:has-text('Weiter')"]:
-        try:
-            page.click(sel, timeout=4000, no_wait_after=True)
-            print(f"Clicked Weiter via {sel}")
-            return True
-        except PWTimeout:
-            continue
-    return False
-
-
 def fail(page, browser, name: str, msg: str):
     snapshot(page, name)
     notify(f"Checker problem: {msg} Check the debug artifact.", "default")
     browser.close()
+
+
+def dismiss_modal_if_open(page, label: str):
+    """If the TevisDialog modal is open, click its OK and wait for it
+    to close. Returns True if a modal was handled."""
+    try:
+        page.wait_for_selector("#TevisDialog.in", timeout=5000)
+    except PWTimeout:
+        print(f"[{label}] no modal appeared")
+        return False
+    page.click("#OKButton", no_wait_after=True)
+    try:
+        page.wait_for_selector("#TevisDialog.in", state="hidden",
+                               timeout=5000)
+    except PWTimeout:
+        pass
+    print(f"[{label}] modal OK clicked")
+    return True
 
 
 def main():
@@ -69,7 +75,7 @@ def main():
         # 2. Step 2: Anliegen page
         page.goto(STEP2_URL, wait_until="networkidle")
 
-        # 3. Tick the Einbuergerung checkbox (custom-styled span)
+        # 3. Tick the Einbuergerung checkbox -> MODAL 1 opens
         try:
             page.click("#span-cnc-600", timeout=5000)
         except PWTimeout:
@@ -79,43 +85,54 @@ def main():
                 fail(page, browser, "error_checkbox",
                      "Anliegen checkbox cnc-600 not found.")
                 return
-        page.wait_for_timeout(500)
 
-        # 4. Weiter -> opens the Hinweis modal (fire-and-forget)
-        click_weiter(page)
+        # 3b. Handle MODAL 1 ("...kein weiteres Anliegen mehr zu")
+        dismiss_modal_if_open(page, "modal1")
 
-        # 5. Confirm the modal opened, then click OK -> navigates to step 3
+        # 4. Weiter should now be enabled -> click it -> MODAL 2 opens
         try:
-            page.wait_for_selector("#TevisDialog.in", timeout=6000)
-            page.click("#OKButton", timeout=5000, no_wait_after=True)
-            print("Hinweis modal OK clicked -> going to Standort")
+            page.wait_for_selector(
+                "#WeiterButton:not(.disabledButton)", timeout=5000)
         except PWTimeout:
-            fail(page, browser, "error_modal",
-                 "Hinweis modal did not open after Weiter.")
+            fail(page, browser, "error_weiter_disabled",
+                 "Weiter did not become enabled after modal 1.")
             return
+        page.click("#WeiterButton", no_wait_after=True)
 
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(2500)
+        # 4b. Handle MODAL 2 ("Bitte buchen Sie einen Termin pro Person")
+        dismiss_modal_if_open(page, "modal2")
 
-        # 6. Standort page -> Weiter -> step 4.
-        #    This Weiter DOES navigate, so allow the default wait.
-        clicked = False
-        for sel in ["#WeiterButton", "input[value='Weiter']",
-                    "button:has-text('Weiter')"]:
-            try:
-                page.click(sel, timeout=5000)
-                clicked = True
-                print(f"Clicked Standort Weiter via {sel}")
-                break
-            except PWTimeout:
-                continue
-        if not clicked:
-            fail(page, browser, "error_step3_weiter",
-                 "Weiter button not found on Standort page.")
+        # 5. After modal 2 OK we must advance past step 2
+        try:
+            page.wait_for_function(
+                "() => !document.title.includes('Schritt 2')",
+                timeout=10000,
+            )
+        except PWTimeout:
+            fail(page, browser, "error_stuck_step2",
+                 "Did not advance past step 2 after modal 2.")
             return
-
         page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(2500)
+        print(f"Advanced to: {page.title()}")
+
+        # 6. Step 3 Standort -> Weiter (navigates normally) -> step 4
+        if "Schritt 3" not in page.title():
+            fail(page, browser, "error_not_step3",
+                 f"Expected step 3, got: {page.title()}")
+            return
+        page.click("#WeiterButton")
+        try:
+            page.wait_for_function(
+                "() => document.title.includes('Schritt 4')",
+                timeout=10000,
+            )
+        except PWTimeout:
+            fail(page, browser, "error_not_step4",
+                 f"Did not reach step 4. Title: {page.title()}")
+            return
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1000)
+        print(f"Reached: {page.title()}")
 
         # 7. Evaluate step 4
         content = page.content()
@@ -123,13 +140,13 @@ def main():
 
         if NO_SLOTS_TEXT in content:
             print("No slots available.")
-        elif "Terminvorschläge" in content or "suggest" in page.url:
+        elif "verfügbar" not in page.title() and \
+                "Terminvorschläge" in content:
             notify("TERMIN VERFÜGBAR! Staatsangehörigkeitsbehörde Ulm "
                    "hat freie Termine. Jetzt buchen: " + BASE)
         else:
-            notify("Checker unsure: unexpected page layout. "
-                   "Possibly slots available - check manually. " + BASE,
-                   "default")
+            notify("Checker unsure on step 4: unexpected layout. "
+                   "Check manually. " + BASE, "default")
 
         browser.close()
 
