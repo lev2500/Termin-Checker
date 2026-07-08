@@ -1,8 +1,9 @@
 """
-Ulm Staatsangehoerigkeitsbehoerde slot checker - FINAL v2
-Walks the wizard like a human (the portal rejects URL shortcuts):
-start -> select2?md=4 -> check Anliegen cnc-600 -> OK modal
--> Weiter -> Standort page -> Weiter -> suggest page -> evaluate.
+Ulm Staatsangehoerigkeitsbehoerde slot checker - FINAL v3
+Correct wizard order:
+  start -> select2?md=4 -> tick cnc-600 -> Weiter (opens Hinweis modal)
+  -> OK in modal (navigates to step 3 Standort) -> Weiter on Standort
+  -> step 4 suggestions -> evaluate.
 """
 import os
 import urllib.request
@@ -36,7 +37,6 @@ def snapshot(page, name: str):
 
 
 def click_weiter(page) -> bool:
-    """Click the continue button, trying known TEVIS variants."""
     for sel in ["#WeiterButton", "input[value='Weiter']",
                 "button:has-text('Weiter')"]:
         try:
@@ -59,18 +59,17 @@ def main():
         browser = p.chromium.launch()
         page = browser.new_page()
 
-        # 1. Start page: establishes session, accept cookies
+        # 1. Start page -> session + cookies
         page.goto(BASE, wait_until="networkidle")
         try:
             page.click("#cookie_msg_btn_yes", timeout=3000)
         except PWTimeout:
             pass
 
-        # 2. Step 2: Anliegen page of the Staatsangehoerigkeitsbehoerde
+        # 2. Step 2: Anliegen page
         page.goto(STEP2_URL, wait_until="networkidle")
 
-        # 3. Tick the checkbox "Anliegen rund um die Einbuergerung".
-        #    It is custom-styled, so click the visible span first.
+        # 3. Tick the Einbuergerung checkbox (custom-styled span)
         try:
             page.click("#span-cnc-600", timeout=5000)
         except PWTimeout:
@@ -82,30 +81,27 @@ def main():
                 return
         page.wait_for_timeout(500)
 
-        # 4. The Hinweis modal ("Bitte buchen Sie einen Termin pro Person")
-        try:
-            page.click("#OKButton", timeout=5000)
-            page.wait_for_selector("#TevisDialog", state="hidden",
-                                   timeout=5000)
-            print("Hinweis modal confirmed")
-        except PWTimeout:
-            print("No modal appeared (ok, continuing)")
-        page.wait_for_timeout(500)
-
-        # 5. Weiter -> Standort page
+        # 4. Weiter -> this OPENS the Hinweis modal (#TevisDialog)
         if not click_weiter(page):
             fail(page, browser, "error_step2_weiter",
                  "Weiter button not clickable on Anliegen page.")
             return
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(1500)
 
-        # 6. Standort page: single location; some setups need a select
-        #    click first - try it, ignore if absent - then Weiter.
+        # 5. Wait for the modal, then click its OK -> navigates to step 3
         try:
-            page.click("button:has-text('Auswählen')", timeout=2000)
+            page.wait_for_selector("#TevisDialog", state="visible",
+                                   timeout=5000)
+            page.click("#OKButton", timeout=5000)
+            print("Hinweis modal OK clicked -> going to Standort")
         except PWTimeout:
-            pass
+            fail(page, browser, "error_modal",
+                 "Hinweis modal / OKButton did not appear after Weiter.")
+            return
+
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(2000)
+
+        # 6. Standort page -> Weiter -> step 4
         if not click_weiter(page):
             fail(page, browser, "error_step3_weiter",
                  "Weiter button not found on Standort page.")
@@ -113,7 +109,7 @@ def main():
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(2000)
 
-        # 7. Evaluate the Terminvorschlaege page
+        # 7. Evaluate step 4
         content = page.content()
         snapshot(page, "last_check")
 
